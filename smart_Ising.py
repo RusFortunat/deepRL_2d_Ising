@@ -59,20 +59,6 @@ def get_state(lattice, X, Y, Nx, Ny):
 
     return state
 
-# compute free energy, right now without entropy, i.e., in zero-temperature limit
-@njit
-def compute_free_energy(lattice, X, Y, spin_new_value, T):
-    spin_old_value = lattice[X][Y]
-    nextX = X + 1 if X < Nx - 1 else 0
-    prevX = X - 1 if X > 0 else Nx - 1
-    nextY = Y + 1 if Y < Ny - 1 else 0
-    prevY = Y - 1 if Y > 0 else Ny - 1
-    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
-    entropy = 1
-    deltaF = deltaE - T*entropy
-
-    return deltaF
-
 # select the action, based on observation or take the random action; greedy epsilon policy implementation
 def select_action_training(state): 
     global steps_done # count total number of steps to go from almost random exploration to more efficient actions
@@ -114,13 +100,16 @@ def step(lattice, X, Y, Nx, Ny, action, T):
     else:
         spin_new_value = -1    
 
-    free_energy_change = compute_free_energy(lattice, X, Y, spin_new_value, T)
+    ising_H = compute_energy(lattice, X, Y, spin_new_value)
 
-    reward = 0.0 
-    if free_energy_change > 0:
-        reward = -1.0*free_energy_change
+    reward = 0
+    if ising_H > 0:
+        #reward = -1.0*ising_H / max(T,1.0)
+        reward = -1.0*ising_H 
     else:
-        reward = 1.0
+        reward = 1.0 
+
+    reward += T*random.randint(-100,100) # i encode entropic part like this
 
     # update state 
     lattice[X][Y] = spin_new_value
@@ -128,6 +117,17 @@ def step(lattice, X, Y, Nx, Ny, action, T):
     new_state = get_state(lattice, X, Y, Nx, Ny)
     return reward, new_state
 
+# compute free energy, right now without entropy, i.e., in zero-temperature limit
+@njit
+def compute_energy(lattice, X, Y, spin_new_value):
+    spin_old_value = lattice[X][Y]
+    nextX = X + 1 if X < Nx - 1 else 0
+    prevX = X - 1 if X > 0 else Nx - 1
+    nextY = Y + 1 if Y < Ny - 1 else 0
+    prevY = Y - 1 if Y > 0 else Ny - 1
+    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
+
+    return deltaE
 
 # update neural network parameters (perform backprop)
 def optimize_model():
@@ -204,9 +204,9 @@ def do_training(num_train_episodes, Nx, Ny, Nt, T):
             target_net.load_state_dict(target_net_state_dict)
 
             # are we done with the episode?
-            if score < - 2 * Nt: # stop training episode if the system is doing very poorly
-                print("The system hasn't learned shit after ", t, " timesteps. Start over..")
-                break   
+            #if score < - 2 * Nt: # stop training episode if the system is doing very poorly
+            #    print("The system hasn't learned shit after ", t, " timesteps. Start over..")
+            #    break   
 
         rewards.append(score) 
         plot_score()
@@ -298,8 +298,7 @@ def plot_score(show_result=False):
 
 # Main
 if __name__ == '__main__':
-    Jesse_we_need_to_train_NN = False
-    PATH = "./NN_params.txt"
+    Jesse_we_need_to_train_NN = True
     ############# Model parameters for Machine Learning #############
     num_episodes = 100      # number of training episodes
     BATCH_SIZE = 100        # the number of transitions sampled from the replay buffer
@@ -316,7 +315,8 @@ if __name__ == '__main__':
     Nx = 50                 # Lx
     Ny = 50                 # Ly
     Nt = 100                # total number of timesteps
-    Temp = 0.0              # temperature
+    Temp = 100.0              # temperature
+    PATH = "./NN_params_Temp" + str(Temp) + ".txt"
 
     ############# Do the training if needed ##############
     if Jesse_we_need_to_train_NN:
@@ -335,7 +335,7 @@ if __name__ == '__main__':
     trained_NN = DQN(n_observations, hidden_size, n_actions).to(device)
     trained_NN.load_state_dict(torch.load(PATH))
     runs = 1
-    sim_duration = 200 
+    sim_duration = 100 
     Nx, Ny = 200, 200 
     memory = np.zeros((Nx, Ny, sim_duration), dtype=int)
     #for run in range(runs):
@@ -365,6 +365,6 @@ if __name__ == '__main__':
     )
 
     print("Saving animation...")
-    filename_animation = "anim_T" + str(Temp) + ".mp4"
+    filename_animation = "anim_T" + str(Temp) + "_M=" + str(total_magnetization[sim_duration-1]) + ".mp4"
     anim.save(filename_animation, fps=fps, extra_args=["-vcodec", "libx264"])
     print("Done!")
