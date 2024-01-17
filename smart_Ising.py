@@ -2,6 +2,8 @@
 # 2d Ising model leads to the same physics as of a regular 2d Ising model.
 # At the moment i will simply go with model A, i.e., spin-flip model with non-conserved magnetizaiton
 
+from numba import njit
+import math
 import numpy as np
 import random
 import torch 
@@ -47,17 +49,32 @@ def get_state(lattice, X, Y, Nx, Ny):
     prevX = X - 1 if X > 0 else Nx - 1
     nextY = Y + 1 if Y < Ny - 1 else 0
     prevY = Y - 1 if Y > 0 else Ny - 1
-    spin0 = lattice[X][Y]
+    #spin0 = lattice[X][Y]
     spin1 = lattice[nextX][Y]
     spin2 = lattice[prevX][Y]
     spin3 = lattice[X][nextY]
     spin4 = lattice[X][prevY]
-    state = [spin0, spin1, spin2, spin3, spin4]
+    state = [spin1, spin2, spin3, spin4]
+    random.shuffle(state)
 
     return state
 
+# compute free energy, right now without entropy, i.e., in zero-temperature limit
+@njit
+def compute_free_energy(lattice, X, Y, spin_new_value, T):
+    spin_old_value = lattice[X][Y]
+    nextX = X + 1 if X < Nx - 1 else 0
+    prevX = X - 1 if X > 0 else Nx - 1
+    nextY = Y + 1 if Y < Ny - 1 else 0
+    prevY = Y - 1 if Y > 0 else Ny - 1
+    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
+    entropy = 1
+    deltaF = deltaE - T*entropy
+
+    return deltaF
+
 # select the action, based on observation or take the random action; greedy epsilon policy implementation
-def select_action(state): 
+def select_action_training(state): 
     global steps_done # count total number of steps to go from almost random exploration to more efficient actions
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * steps_done / EPS_DECAY)
@@ -74,24 +91,34 @@ def select_action(state):
 
     return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
 
-# update the position of the particle
-def step(lattice, X, Y, Nx, Ny, action):
+# post-training action selection
+def select_action(state): 
+    sample = random.random()
+    eps_threshold = EPS_END 
     
-    spin_old_value = lattice[X][Y]
+    if sample > eps_threshold:
+        with torch.no_grad():
+            # t.max(1) will return the largest column value of each row. Second column on max result is index of where max element was
+            # found, so we pick action with the larger expected reward.
+            return trained_NN(state).max(1)[1].view(1, 1) # view(1,1) changes shape to [[action], dtype]
+    else:
+        # select a random action; 
+        rand_aciton = random.randint(0,1) # flip up or down randomly
+
+    return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
+
+# update the position of the particle
+def step(lattice, X, Y, Nx, Ny, action, T):
     if action == 0:
         spin_new_value = 1
     else:
-        spin_new_value = -1
+        spin_new_value = -1    
 
-    # compute reward
-    nextX = X + 1 if X < Nx - 1 else 0
-    prevX = X - 1 if X > 0 else Nx - 1
-    nextY = Y + 1 if Y < Ny - 1 else 0
-    prevY = Y - 1 if Y > 0 else Ny - 1
-    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
+    free_energy_change = compute_free_energy(lattice, X, Y, spin_new_value, T)
+
     reward = 0.0 
-    if deltaE > 0:
-        reward = -1.0*deltaE
+    if free_energy_change > 0:
+        reward = -1.0*free_energy_change
     else:
         reward = 1.0
 
@@ -100,6 +127,7 @@ def step(lattice, X, Y, Nx, Ny, action):
 
     new_state = get_state(lattice, X, Y, Nx, Ny)
     return reward, new_state
+
 
 # update neural network parameters (perform backprop)
 def optimize_model():
@@ -134,7 +162,6 @@ def optimize_model():
     # Compute Huber loss
     criterion = nn.SmoothL1Loss()
     loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
-    # Optimize the model
     optimizer.zero_grad()
     loss.backward()
     # In-place gradient clipping
@@ -142,10 +169,9 @@ def optimize_model():
     optimizer.step()
 
 # part of the code where all training is done
-def do_training(num_train_episodes, Nx, Ny, Nt):
-    for i_episode in range(num_train_episodes): # average the data over different independent runs
+def do_training(num_train_episodes, Nx, Ny, Nt, T):
+    for i_episode in range(num_train_episodes):
         print("Training episode ", i_episode)
-        
         # we start from a disordered configuration each time, i.e., random initial conditions 
         lattice = np.random.randint(2, size=(Nx, Ny))
         for x in range(Nx): # must be a smarter way, but i'm lazy
@@ -154,6 +180,7 @@ def do_training(num_train_episodes, Nx, Ny, Nt):
                     lattice[x][y] = -1
 
         # main update loop; I use Monte Carlo random sequential updates here
+        score = 0
         for t in range(Nt):
             # pick random spin
             X = random.randint(0, Nx-1)
@@ -161,8 +188,8 @@ def do_training(num_train_episodes, Nx, Ny, Nt):
             # update lattice state
             state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
             state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            action = select_action(state) # select action
-            reward, next_state = step(lattice, X, Y, Nx, Ny, action) # update particle's position
+            action = select_action_training(state) # select action
+            reward, next_state = step(lattice, X, Y, Nx, Ny, action, T) # update particle's position
             reward = torch.tensor([reward], device=device)
             next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
             score += reward
@@ -177,22 +204,18 @@ def do_training(num_train_episodes, Nx, Ny, Nt):
             target_net.load_state_dict(target_net_state_dict)
 
             # are we done with the episode?
-            if score < - 2 * Nt: # stop episode if the system is doing very poorly
+            if score < - 2 * Nt: # stop training episode if the system is doing very poorly
                 print("The system hasn't learned shit after ", t, " timesteps. Start over..")
-                rewards.append(score) 
-                episode_durations.append(t)
-                plot_durations()
                 break   
-          
+
+        rewards.append(score) 
+        plot_score()
+
     torch.save(target_net.state_dict(),PATH)
-    plot_durations(show_result=True)
+    plot_score(show_result=True)
 
 # after the training has been finished, we simulate the system's relaxational dynamics with fixed NN parameters
 def post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, n_actions):
-    print("The training is done, let's now see what are the results")
-    ############# Load NN parameters ##############
-    trained_NN = DQN(n_observations, hidden_size, n_actions).to(device)
-    trained_NN.load_state_dict(torch.load(PATH))
 
     # first and second moments
     total_magnetization = np.zeros(sim_duration)
@@ -208,12 +231,19 @@ def post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, 
     lattice_t0 =  np.copy(lattice) # to compute autocorrelation function
 
     for t in range(sim_duration):
-        X = random.randint(0, Nx-1)
-        Y = random.randint(0, Ny-1)
-        state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
-        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        action = select_action(state) # select action
-        _, _ = step(lattice, X, Y, Nx, Ny, action) # update particle's position
+        memory[:,:,t] = lattice # record the state of the lattice for the animation
+        for n in range(Nx*Ny):
+            X = random.randint(0, Nx-1)
+            Y = random.randint(0, Ny-1)
+            state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
+            state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            action = select_action(state) # select action
+            if action == 0:
+                spin_new_value = 1
+            else:
+                spin_new_value = -1    
+            # update state 
+            lattice[X][Y] = spin_new_value
 
         # compute first and second moments
         tot_mat = 0
@@ -228,35 +258,33 @@ def post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, 
         correlation_function[t] = auto_corr
         print("t = ", t, "; M = ", tot_mat, "; C = ", auto_corr)
 
-    return total_magnetization, correlation_function
+    return total_magnetization, correlation_function, memory
 
 # Plotting part
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 is_ipython = 'inline' in matplotlib.get_backend()
 if is_ipython:
     from IPython import display
 
 # plots
-def animate(frame):
-    im.set_array(csave[frame+200])
-    return im,
-
-def plot_durations(show_result=False):
+def plot_score(show_result=False):
     plt.figure(1)
-    durations_t = torch.tensor(episode_durations, dtype=torch.float)
     if show_result:
         plt.title('Result')
     else:
         plt.clf() # clf -- clear current figure
         plt.title('Training...')
     plt.xlabel('Episode')
-    plt.ylabel('Durations')
-    #plt.ylabel('Reward')
-    plt.plot(durations_t.numpy())
-    # Take 100 episode averages and plot them too
-    if len(durations_t) >= 10:
-        means = durations_t.unfold(0, 10, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(99), means))
-        plt.plot(means.numpy())
+    plt.ylabel('Score')
+    plt.plot(rewards)
+    #plt.plot(rewards.numpy())
+    # Take 50 episode averages and plot them too
+    #if len(rewards) >= 50:
+    #    means = rewards.unfold(0, 10, 1).mean(1).view(-1)
+    #    means = torch.cat((torch.zeros(99), means))
+    #    plt.plot(means.numpy())
 
     plt.pause(0.001)  # pause a bit so that plots are updated
     if is_ipython:
@@ -265,29 +293,30 @@ def plot_durations(show_result=False):
             display.clear_output(wait=True)
         else:
             display.display(plt.gcf())
-            output = "/Users/Ruslan.Mukhamadiarov/Work/smartaxis/codepy/training_durations.png"
+            output = "./training_score.png"
             plt.savefig(output, format = "png", dpi = 300)
 
 # Main
 if __name__ == '__main__':
-    Jesse_we_need_to_train_NN = True
+    Jesse_we_need_to_train_NN = False
     PATH = "./NN_params.txt"
     ############# Model parameters for Machine Learning #############
-    num_episodes = 500      # number of training episodes
+    num_episodes = 100      # number of training episodes
     BATCH_SIZE = 100        # the number of transitions sampled from the replay buffer
     GAMMA = 0.99            # the discounting factor
     EPS_START = 0.9         # EPS_START is the starting value of epsilon; determines how random our action choises are at the beginning
-    EPS_END = 0.05          # EPS_END is the final value of epsilon
+    EPS_END = 0.001          # EPS_END is the final value of epsilon
     EPS_DECAY = 1000        # EPS_DECAY controls the rate of exponential decay of epsilon, higher means a slower decay
     TAU = 0.005             # TAU is the update rate of the target network
-    LR = 1e-4               # LR is the learning rate of the AdamW optimizer
-    n_observations = 5      # for simplicity, just choose a square 3x3 patch around the particle 
+    LR = 1e-3               # LR is the learning rate of the AdamW optimizer
+    n_observations = 4      # for simplicity, just choose a patch with nearest-neighbors
     n_actions = 2           # the particle can jump on any neighboring lattice sites, or stay put and eat
-    hidden_size = 100       # hidden size of the network
+    hidden_size = 32        # hidden size of the network
     ############# Lattice simulation parameters #############
-    Nx = 100                # Lx
-    Ny = 100                # Ly
-    Nt = 10000              # total number of timesteps
+    Nx = 50                 # Lx
+    Ny = 50                 # Ly
+    Nt = 100                # total number of timesteps
+    Temp = 0.0              # temperature
 
     ############# Do the training if needed ##############
     if Jesse_we_need_to_train_NN:
@@ -299,16 +328,43 @@ if __name__ == '__main__':
         rewards = []
         episode_durations = []
         steps_done = 0 
-        do_training() # training is hapenning for the c=1.0 field
+        do_training(num_episodes, Nx, Ny, Nt, Temp) 
 
     ############# Simulate the system relaxational dynamics after training ##############
+    print("The training is done, let's now see what are the results")
+    trained_NN = DQN(n_observations, hidden_size, n_actions).to(device)
+    trained_NN.load_state_dict(torch.load(PATH))
     runs = 1
-    sim_duration = 2000 #int(mean_duration) # was about 200 
-    Nx, Ny = 200, 200 # because average life expectancy was about 200
+    sim_duration = 200 
+    Nx, Ny = 200, 200 
+    memory = np.zeros((Nx, Ny, sim_duration), dtype=int)
     #for run in range(runs):
-    total_magnetization, correlation_function = post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, n_actions)
+    total_magnetization, correlation_function, memory = post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, n_actions)
     
     with open('Ouput.txt', 'w') as f:
         for t in range(sim_duration):
             output_string = str(t) + "\t" + str(total_magnetization[t]) + "\t" + str(correlation_function[t]) + "\n"
             f.write(output_string)
+
+    # animation
+    import matplotlib.animation as animation
+    fig = plt.figure(figsize=(24, 24))
+    im = plt.imshow(memory[:, :, 1], interpolation="none", aspect="auto", vmin=0, vmax=1)
+
+    def animate_func(i):
+        im.set_array(memory[:, :, i])
+        return [im]
+
+    fps = 60
+
+    anim = animation.FuncAnimation(
+        fig,
+        animate_func,
+        frames=sim_duration,
+        interval=1000 / fps,  # in ms
+    )
+
+    print("Saving animation...")
+    filename_animation = "anim_T" + str(Temp) + ".mp4"
+    anim.save(filename_animation, fps=fps, extra_args=["-vcodec", "libx264"])
+    print("Done!")
