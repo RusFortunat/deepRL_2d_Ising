@@ -69,7 +69,7 @@ if __name__ == '__main__':
     Nx = 100                # Lx
     Ny = 100                # Ly
     sim_duration = 500      # total number of timesteps
-    T = 0.1                 # temperature
+    T = 1.0                 # temperature
     runs = 1
 
     #for run in range(runs):

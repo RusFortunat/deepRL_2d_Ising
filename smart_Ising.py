@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.distributions import Categorical
 from collections import namedtuple, deque
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,10 +55,20 @@ def get_state(lattice, X, Y, Nx, Ny):
     spin2 = lattice[prevX][Y]
     spin3 = lattice[X][nextY]
     spin4 = lattice[X][prevY]
+#    state = spin1 + spin2 + spin3 + spin4
     state = [spin1, spin2, spin3, spin4]
     random.shuffle(state)
 
     return state
+
+# count spins
+def count_spins(lattice, X, Y):
+    nextX = X + 1 if X < Nx - 1 else 0
+    prevX = X - 1 if X > 0 else Nx - 1
+    nextY = Y + 1 if Y < Ny - 1 else 0
+    prevY = Y - 1 if Y > 0 else Ny - 1
+    
+    return lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]
 
 # select the action, based on observation or take the random action; greedy epsilon policy implementation
 def select_action_training(state): 
@@ -70,46 +81,34 @@ def select_action_training(state):
         with torch.no_grad():
             # t.max(1) will return the largest column value of each row. Second column on max result is index of where max element was
             # found, so we pick action with the larger expected reward.
+            #print("policy_net(state) ", policy_net(state))
+            #print("policy_net(state).max(0) ", policy_net(state).max(0))
+            #print("policy_net(state).max(0)[0] ", policy_net(state).max(0)[1])
+            #print("policy_net(state).max(1).indices.view(1, 1) ", policy_net(state).max(1).indices.view(1, 1))
             return policy_net(state).max(1)[1].view(1, 1) # view(1,1) changes shape to [[action], dtype]
     else:
         # select a random action; 
         rand_aciton = random.randint(0,1) # flip up or down randomly
-
-    return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
-
-# post-training action selection
-def select_action(state): 
-    sample = random.random()
-    eps_threshold = EPS_END 
-    
-    if sample > eps_threshold:
-        with torch.no_grad():
-            # t.max(1) will return the largest column value of each row. Second column on max result is index of where max element was
-            # found, so we pick action with the larger expected reward.
-            return trained_NN(state).max(1)[1].view(1, 1) # view(1,1) changes shape to [[action], dtype]
-    else:
-        # select a random action; 
-        rand_aciton = random.randint(0,1) # flip up or down randomly
-
-    return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
+        return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
 
 # update the position of the particle
-def step(lattice, X, Y, Nx, Ny, action, T):
-    if action == 0:
+def step(lattice, X, Y, Nx, Ny, action):
+    if action == 0: # up
         spin_new_value = 1
-    else:
+    else: # down
         spin_new_value = -1    
 
-    ising_H = compute_energy(lattice, X, Y, spin_new_value)
+    #ising_H = compute_energy(lattice, X, Y, spin_new_value)
+    NN_spins = count_spins(lattice, X, Y)
 
     reward = 0
-    if ising_H > 0:
+    if (NN_spins > 0 and action == 0) or (NN_spins < 0 and action == 1) or NN_spins == 0:
         #reward = -1.0*ising_H / max(T,1.0)
-        reward = -1.0*ising_H 
+        reward = 1.0
     else:
-        reward = 1.0 
+        reward = -10.0 * abs(NN_spins) # scale punishment
 
-    reward += T*random.randint(-100,100) # i encode entropic part like this
+    #reward += T*random.randint(-100,100) # i encode entropic part like this
 
     # update state 
     lattice[X][Y] = spin_new_value
@@ -118,16 +117,16 @@ def step(lattice, X, Y, Nx, Ny, action, T):
     return reward, new_state
 
 # compute free energy, right now without entropy, i.e., in zero-temperature limit
-@njit
-def compute_energy(lattice, X, Y, spin_new_value):
-    spin_old_value = lattice[X][Y]
-    nextX = X + 1 if X < Nx - 1 else 0
-    prevX = X - 1 if X > 0 else Nx - 1
-    nextY = Y + 1 if Y < Ny - 1 else 0
-    prevY = Y - 1 if Y > 0 else Ny - 1
-    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
+#@njit
+#def compute_energy(lattice, X, Y, spin_new_value):
+#    spin_old_value = lattice[X][Y]
+#    nextX = X + 1 if X < Nx - 1 else 0
+#    prevX = X - 1 if X > 0 else Nx - 1
+#    nextY = Y + 1 if Y < Ny - 1 else 0
+#    prevY = Y - 1 if Y > 0 else Ny - 1
+#    deltaE = -1.0*(spin_new_value - spin_old_value)*(lattice[nextX][Y] + lattice[prevX][Y] + lattice[X][nextY] + lattice[X][prevY]) 
 
-    return deltaE
+#    return deltaE
 
 # update neural network parameters (perform backprop)
 def optimize_model():
@@ -169,7 +168,7 @@ def optimize_model():
     optimizer.step()
 
 # part of the code where all training is done
-def do_training(num_train_episodes, Nx, Ny, Nt, T):
+def do_training(num_train_episodes, Nx, Ny, Nt):
     for i_episode in range(num_train_episodes):
         print("Training episode ", i_episode)
         # we start from a disordered configuration each time, i.e., random initial conditions 
@@ -189,7 +188,7 @@ def do_training(num_train_episodes, Nx, Ny, Nt, T):
             state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
             state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             action = select_action_training(state) # select action
-            reward, next_state = step(lattice, X, Y, Nx, Ny, action, T) # update particle's position
+            reward, next_state = step(lattice, X, Y, Nx, Ny, action) # update particle's position
             reward = torch.tensor([reward], device=device)
             next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
             score += reward
@@ -214,8 +213,38 @@ def do_training(num_train_episodes, Nx, Ny, Nt, T):
     torch.save(target_net.state_dict(),PATH)
     plot_score(show_result=True)
 
+# post-training action selection
+def select_action_post_training(state, T): 
+    
+    # interpret Q values as probabilities when simulating dynamics of the system 
+    # in principle this could be easily extended to make this more general, but i am a lazy boi
+    with torch.no_grad():
+        Q_values = trained_NN(state)
+        #print("before division by T: ", Q_values)
+        Q_values[0][0] /= T 
+        Q_values[0][1] /= T 
+        #print("after division by T: ", Q_values)
+        probs = torch.softmax(Q_values, dim=1) # converts logits to probabilities (torch object)
+        #print("state ", state)
+        #print("probs ", probs)
+        dist = Categorical(probs) # feeds torch object to generate a list of probs (numpy object ?)
+        action = dist.sample().numpy()[0] # sample list of probs and return the action
+        
+        return action
+
+    #sample = random.random()
+
+    #with torch.no_grad():
+            # t.max(1) will return the largest column value of each row. Second column on max result is index of where max element was
+            # found, so we pick action with the larger expected reward.
+    #        return trained_NN(state).max(1)[1].view(1, 1) # view(1,1) changes shape to [[action], dtype]
+    #else:
+        # select a random action; 
+    #    rand_aciton = random.randint(0,1) # flip up or down randomly
+    #    return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
+
 # after the training has been finished, we simulate the system's relaxational dynamics with fixed NN parameters
-def post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, n_actions):
+def post_training_simulation(Nx, Ny, sim_duration, T):
 
     # first and second moments
     total_magnetization = np.zeros(sim_duration)
@@ -237,7 +266,7 @@ def post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, 
             Y = random.randint(0, Ny-1)
             state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
             state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            action = select_action(state) # select action
+            action = select_action_post_training(state, T) # select action
             if action == 0:
                 spin_new_value = 1
             else:
@@ -293,7 +322,7 @@ def plot_score(show_result=False):
             display.clear_output(wait=True)
         else:
             display.display(plt.gcf())
-            output = "./training_score.png"
+            output = "training_score.png"
             plt.savefig(output, format = "png", dpi = 300)
 
 # Main
@@ -308,14 +337,14 @@ if __name__ == '__main__':
     EPS_DECAY = 1000        # EPS_DECAY controls the rate of exponential decay of epsilon, higher means a slower decay
     TAU = 0.005             # TAU is the update rate of the target network
     LR = 1e-3               # LR is the learning rate of the AdamW optimizer
-    n_observations = 4      # for simplicity, just choose a patch with nearest-neighbors
+    n_observations = 4      # just give network a difference between positive and negative spins
     n_actions = 2           # the particle can jump on any neighboring lattice sites, or stay put and eat
-    hidden_size = 32        # hidden size of the network
+    hidden_size = 16        # hidden size of the network
     ############# Lattice simulation parameters #############
     Nx = 50                 # Lx
     Ny = 50                 # Ly
     Nt = 100                # total number of timesteps
-    Temp = 100.0              # temperature
+    Temp = 30.0              # temperature
     PATH = "./NN_params_Temp" + str(Temp) + ".txt"
 
     ############# Do the training if needed ##############
@@ -328,7 +357,7 @@ if __name__ == '__main__':
         rewards = []
         episode_durations = []
         steps_done = 0 
-        do_training(num_episodes, Nx, Ny, Nt, Temp) 
+        do_training(num_episodes, Nx, Ny, Nt) 
 
     ############# Simulate the system relaxational dynamics after training ##############
     print("The training is done, let's now see what are the results")
@@ -339,7 +368,7 @@ if __name__ == '__main__':
     Nx, Ny = 200, 200 
     memory = np.zeros((Nx, Ny, sim_duration), dtype=int)
     #for run in range(runs):
-    total_magnetization, correlation_function, memory = post_training_simulation(Nx, Ny, sim_duration, n_observations, hidden_size, n_actions)
+    total_magnetization, correlation_function, memory = post_training_simulation(Nx, Ny, sim_duration, Temp)
     
     with open('Ouput.txt', 'w') as f:
         for t in range(sim_duration):
