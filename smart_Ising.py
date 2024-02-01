@@ -92,7 +92,7 @@ def select_action_training(state):
         return torch.tensor([[rand_aciton]], device=device, dtype=torch.long)
 
 # update the position of the particle
-def step(lattice, X, Y, Nx, Ny, action):
+def step(lattice, X, Y, Nx, Ny, action, T):
     if action == 0: # up
         spin_new_value = 1
     else: # down
@@ -101,14 +101,19 @@ def step(lattice, X, Y, Nx, Ny, action):
     #ising_H = compute_energy(lattice, X, Y, spin_new_value)
     NN_spins = count_spins(lattice, X, Y)
 
-    reward = 0
-    if (NN_spins > 0 and action == 0) or (NN_spins < 0 and action == 1) or NN_spins == 0:
-        #reward = -1.0*ising_H / max(T,1.0)
-        reward = 1.0
-    else:
-        reward = -10.0 * abs(NN_spins) # scale punishment
+    deltaE = 0
+    deltaS = 0
+    if (NN_spins > 0 and action == 0) or (NN_spins < 0 and action == 1) : # reduce energy, reduce entropy
+        deltaS = - 1.0 
+        deltaE = - 1.0 
+    elif NN_spins == 0:
+        deltaS = 0.0
+        deltaE = 0.0
+    else: # increase energy, increase entropy
+        deltaS = 1.0 
+        deltaE = 1.0 
 
-    #reward += T*random.randint(-100,100) # i encode entropic part like this
+    reward = - (deltaE - T * deltaS) * abs(NN_spins) # minimize free energy = increase reward
 
     # update state 
     lattice[X][Y] = spin_new_value
@@ -168,7 +173,7 @@ def optimize_model():
     optimizer.step()
 
 # part of the code where all training is done
-def do_training(num_train_episodes, Nx, Ny, Nt):
+def do_training(num_train_episodes, Nx, Ny, Nt, T):
     for i_episode in range(num_train_episodes):
         print("Training episode ", i_episode)
         # we start from a disordered configuration each time, i.e., random initial conditions 
@@ -188,7 +193,7 @@ def do_training(num_train_episodes, Nx, Ny, Nt):
             state = get_state(lattice, X, Y, Nx, Ny) # get the observation state
             state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             action = select_action_training(state) # select action
-            reward, next_state = step(lattice, X, Y, Nx, Ny, action) # update particle's position
+            reward, next_state = step(lattice, X, Y, Nx, Ny, action, T) # update particle's position
             reward = torch.tensor([reward], device=device)
             next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
             score += reward
@@ -221,8 +226,8 @@ def select_action_post_training(state, T):
     with torch.no_grad():
         Q_values = trained_NN(state)
         #print("before division by T: ", Q_values)
-        Q_values[0][0] /= T 
-        Q_values[0][1] /= T 
+        #Q_values[0][0] /= T 
+        #Q_values[0][1] /= T 
         #print("after division by T: ", Q_values)
         probs = torch.softmax(Q_values, dim=1) # converts logits to probabilities (torch object)
         #print("state ", state)
@@ -344,7 +349,7 @@ if __name__ == '__main__':
     Nx = 50                 # Lx
     Ny = 50                 # Ly
     Nt = 100                # total number of timesteps
-    Temp = 30.0              # temperature
+    Temp = 0.93              # temperature
     PATH = "./NN_params_Temp" + str(Temp) + ".txt"
 
     ############# Do the training if needed ##############
@@ -357,7 +362,7 @@ if __name__ == '__main__':
         rewards = []
         episode_durations = []
         steps_done = 0 
-        do_training(num_episodes, Nx, Ny, Nt) 
+        do_training(num_episodes, Nx, Ny, Nt, Temp) 
 
     ############# Simulate the system relaxational dynamics after training ##############
     print("The training is done, let's now see what are the results")
